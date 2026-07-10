@@ -1,0 +1,2017 @@
+import React, { useState, useEffect, useRef } from "react";
+import { useNavigate, useSearchParams, useLocation } from "react-router-dom";
+import {
+  Steps,
+  Button,
+  message,
+  Spin,
+  Modal,
+  Form,
+  Progress,
+  Drawer,
+  Badge,
+  Tooltip,
+  Input,
+  Select,
+  Row,
+  Col,
+  Divider,
+} from "antd";
+import {
+  SaveOutlined,
+  ArrowLeftOutlined,
+  ArrowRightOutlined,
+  CheckOutlined,
+  MenuOutlined,
+  CheckCircleOutlined,
+  ClockCircleOutlined,
+  InfoCircleOutlined,
+  SmileOutlined,
+  EyeOutlined,
+  DownloadOutlined,
+} from "@ant-design/icons";
+import LoadingSpinner from "../../components/LoadingSpinner";
+import supplierQuestionnaireService from "../../lib/supplierQuestionnaireService";
+import {
+  saveV3Questionnaire,
+  submitV3Questionnaire,
+  downloadV3Pdf,
+  loadMineV3,
+  loadV3Questionnaire,
+  mapV3BackendToForm,
+} from "../../lib/questionnaireV3Api";
+import authService from "../../lib/authService";
+import productService from "../../lib/productService";
+import userManagementService from "../../lib/userManagementService";
+import type { SupplierOnboarding } from "../../types/userManagement";
+import { QUESTIONNAIRE_SCHEMA } from "../../config/questionnaireSchema";
+import QuestionnaireCardForm from "./fullform/QuestionnaireCardForm";
+import { C } from "./fullform/theme";
+import { SECTION_META } from "./fullform/layout";
+import QuestionnaireAssistant from "./QuestionnaireAssistant";
+import QuestionnairePreviewModal from "./QuestionnairePreviewModal";
+import { buildPdfSections } from "./buildPdfSections";
+import {
+  getFuelTypeDropdown,
+  getSubFuelTypeDropdown,
+  getEnergySourceDropdown,
+  getEnergyTypeDropdown,
+  getRefrigerantTypeDropdown,
+  getProcessSpecificEnergyDropdown,
+  getTransportModeDropdown,
+  type DropdownItem,
+} from "../../lib/questionnaireDropdownService";
+
+const { Step } = Steps;
+
+const SupplierQuestionnaire: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const [form] = Form.useForm();
+
+  // Get URL params
+  let sgiq_id = searchParams.get("sgiq_id");
+  let sup_id = searchParams.get("sup_id");
+  let bom_pcf_id = searchParams.get("bom_pcf_id");
+  let user_id = searchParams.get("user_id");
+  // Client mode params
+  let is_client = searchParams.get("is_client") === "true";
+  let client_id = searchParams.get("client_id");
+  let product_id = searchParams.get("product_id");
+
+  if (location.search) {
+    const urlParams = new URLSearchParams(location.search);
+    sgiq_id = sgiq_id || urlParams.get("sgiq_id");
+    sup_id = sup_id || urlParams.get("sup_id");
+    bom_pcf_id = bom_pcf_id || urlParams.get("bom_pcf_id");
+    user_id = user_id || urlParams.get("user_id");
+    // Client mode params
+    is_client = is_client || urlParams.get("is_client") === "true";
+    client_id = client_id || urlParams.get("client_id");
+    product_id = product_id || urlParams.get("product_id");
+  }
+
+  // Determine if this is client mode
+  const isClientMode = !!(is_client && client_id && product_id && bom_pcf_id);
+
+  const isViewMode = location.pathname.includes("/view");
+  const isEditMode = location.pathname.includes("/edit");
+  const isCreateMode =
+    !sgiq_id &&
+    (location.pathname.includes("/new") || (!isViewMode && !isEditMode));
+  const isPublicRoute = !!(sup_id && bom_pcf_id); // Public route when accessed via supplier link
+
+  const [currentStep, setCurrentStep] = useState(0);
+  const [formData, setFormData] = useState<Record<string, any>>({});
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [questionnaireId, setQuestionnaireId] = useState<string | null>(
+    sgiq_id,
+  );
+  const [autoSaveStatus, setAutoSaveStatus] = useState<
+    "idle" | "saving" | "saved"
+  >("idle");
+  const [lastSaved, setLastSaved] = useState<Date | null>(null);
+  const [sidebarVisible, setSidebarVisible] = useState(false);
+  const [completedSteps, setCompletedSteps] = useState<Set<number>>(new Set());
+  const [formErrors, setFormErrors] = useState<Record<string, string[]>>({});
+  const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // The page is fixed-height; the content column is the scroll area, so step
+  // changes must scroll THIS element (not window) back to the top.
+  const contentScrollRef = useRef<HTMLDivElement | null>(null);
+  const hasCalledStageUpdateRef = useRef<boolean>(false);
+  const [autoPopulatedFields, setAutoPopulatedFields] = useState<Set<string>>(
+    new Set(),
+  );
+  const [isCompleted, setIsCompleted] = useState(false);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [submittedSgiqId, setSubmittedSgiqId] = useState<string | null>(null);
+  // V3 (28-question) backend response id — captured after the first save, reused for subsequent upserts + submit.
+  const [v3ResponseId, setV3ResponseId] = useState<string | null>(null);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+
+  // Supplier onboarding state
+  const [isCheckingOnboarding, setIsCheckingOnboarding] = useState(false);
+  const [isOnboarded, setIsOnboarded] = useState<boolean | null>(null);
+  const [showOnboardingForm, setShowOnboardingForm] = useState(false);
+  const [onboardingForm] = Form.useForm();
+  const [isSubmittingOnboarding, setIsSubmittingOnboarding] = useState(false);
+
+  // BOM components assigned to this supplier — sourced from the immutable
+  // client-uploaded BOM. Used as the option list for every MPN dropdown so
+  // suppliers cannot lose options by deleting/re-adding rows.
+  const [bomComponents, setBomComponents] = useState<
+    Array<{ bom_id: string; material_number: string; component_name: string }>
+  >([]);
+
+  useEffect(() => {
+    if (!sup_id || !bom_pcf_id || isClientMode) return;
+    let cancelled = false;
+    (async () => {
+      const result = await supplierQuestionnaireService.getBomComponentsForSupplier(
+        bom_pcf_id,
+        sup_id
+      );
+      if (!cancelled && result.success) {
+        setBomComponents(result.data);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sup_id, bom_pcf_id, isClientMode]);
+
+  // V3 hard-coded defaults: Q6 PCF type and Q7 system boundary are fixed per
+  // Catena-X policy and the corresponding fields are disabled in the schema.
+  // We seed them into formData once so they are persisted and submitted even
+  // if the supplier never visits Section B.
+  useEffect(() => {
+    setFormData((prev) => {
+      const next = { ...prev };
+      const sp = { ...(prev?.scope_period ?? {}) };
+      const methodology = { ...(prev?.methodology ?? {}) };
+      const verification = { ...(prev?.verification ?? {}) };
+      let changed = false;
+      if (!sp.pcf_type) {
+        sp.pcf_type = "1: Retrospective PCF (historical / measured data)";
+        changed = true;
+      }
+      if (!sp.system_boundary) {
+        sp.system_boundary = "Cradle-to-Gate (default, per Catena-X)";
+        changed = true;
+      }
+      // Q21 fixed defaults — supplier does not change these (disabled fields).
+      if (!methodology.cross_sectoral_standard) {
+        methodology.cross_sectoral_standard = "ISO 14067";
+        changed = true;
+      }
+      if (!methodology.ipcc_gwp_version) {
+        methodology.ipcc_gwp_version = "AR6";
+        changed = true;
+      }
+      // Q21b default — sector PCR defaults to the Catena-X Rulebook (editable).
+      if (!methodology.product_sector_pcr) {
+        methodology.product_sector_pcr = "Catena-X PCF Rulebook v4";
+        changed = true;
+      }
+      // Q22 default — free attribution defaults to No (editable).
+      if (!methodology.free_attribution_used) {
+        methodology.free_attribution_used = "No";
+        changed = true;
+      }
+      // Q23b default — waste incineration defaults to polluter-pays (editable).
+      if (!methodology.waste_incineration_method) {
+        methodology.waste_incineration_method = "Polluter pays principle (per §5.2.4)";
+        changed = true;
+      }
+      // Q26 fixed defaults — attestation type + conformant standards (disabled).
+      if (!verification.attestation_type) {
+        verification.attestation_type = "PCF Program Certification";
+        changed = true;
+      }
+      if (!verification.conformant_standards) {
+        verification.conformant_standards =
+          "Catena-X Product Carbon Footprint Rulebook v4";
+        changed = true;
+      }
+      if (!changed) return prev;
+      next.scope_period = sp;
+      next.methodology = methodology;
+      next.verification = verification;
+      return next;
+    });
+  }, []);
+
+  // BACKFILL component_name for every Form.List row that has an MPN selected
+  // (saved before the bomMaterials onChange started writing component_name).
+  // This is the parent-level backfill — it mutates formData directly so the
+  // values arrive at DynamicQuestionnaireForm already filled and the readOnly
+  // Component Name cell renders correctly on first paint.
+  //
+  // CRITICAL: the effect depends on BOTH bomComponents AND formData. Without
+  // formData in the dep array the backfill misses the common case: bomComponents
+  // arrives from /api/bom-components quickly, but the draft formData arrives a
+  // few hundred ms later from /api/questionnaire/:id. If we only ran on
+  // bomComponents change, the backfill would scan an empty formData and do
+  // nothing, then the draft would arrive (without component_name) and never get
+  // backfilled. With formData also as a dep, the effect re-runs the moment the
+  // draft lands. The functional setState returning `prev` when nothing
+  // changes prevents an infinite re-render loop.
+  useEffect(() => {
+    if (!Array.isArray(bomComponents) || bomComponents.length === 0) return;
+    // Known table paths in the V3 schema whose rows use bomMaterials. If any
+    // new table with bomMaterials is added, append its [parentKey, childKey]
+    // pair here. The function below applies the same backfill rule (look up
+    // material_number → component_name) to every row in each list.
+    // Verified against questionnaireSchemaV3.ts — every `type: "table"` field
+    // that uses `apiDropdown: "bomMaterials"` in any of its columns.
+    const listPaths: Array<[string, string]> = [
+      ["bom", "co_products"],            // Q9.1
+      ["energy", "production_waste"],    // Q14
+      ["packaging", "materials_used"],   // Q16
+      ["packaging", "transport"],        // Q16.1
+      ["packaging", "waste"],            // Q17
+      ["transport", "legs"],             // Q19
+    ];
+    setFormData((prev) => {
+      if (!prev || typeof prev !== "object") return prev;
+      let mutated = false;
+      const next: any = { ...prev };
+      for (const [parent, child] of listPaths) {
+        const parentObj = next[parent];
+        if (!parentObj || typeof parentObj !== "object") continue;
+        const arr = parentObj[child];
+        if (!Array.isArray(arr) || arr.length === 0) continue;
+        let rowMutated = false;
+        const newArr = arr.map((row: any) => {
+          if (!row || typeof row !== "object") return row;
+          if (row.component_name && row.product_name) return row;
+          // The dropdown column may be named "mpn" OR "product_id" depending
+          // on table — check both.
+          const mpnVal =
+            row.mpn ?? row.product_id ?? row.material_number ?? row.mpn_code;
+          if (!mpnVal) return row;
+          const bom = bomComponents.find(
+            (b) => b.material_number === mpnVal
+          );
+          if (!bom) return row;
+          rowMutated = true;
+          return {
+            ...row,
+            bom_id: row.bom_id || bom.bom_id,
+            material_number: row.material_number || bom.material_number,
+            component_name: row.component_name || bom.component_name,
+            product_name: row.product_name || bom.component_name,
+          };
+        });
+        if (rowMutated) {
+          mutated = true;
+          next[parent] = { ...parentObj, [child]: newArr };
+        }
+      }
+      return mutated ? next : prev;
+    });
+  }, [bomComponents, formData]);
+
+  // Check supplier onboarding status first (only for supplier mode with sup_id)
+  useEffect(() => {
+    const checkOnboardingStatus = async () => {
+      if (sup_id && !isClientMode && isCreateMode) {
+        setIsCheckingOnboarding(true);
+        try {
+          const result = await userManagementService.checkSupplierOnboardingStatus(sup_id);
+          setIsOnboarded(result.isOnboarded);
+          if (!result.isOnboarded) {
+            setShowOnboardingForm(true);
+            // Pre-fill form if we have partial data
+            if (result.supplierData) {
+              onboardingForm.setFieldsValue(result.supplierData);
+            }
+          }
+        } catch (error) {
+          console.error("Error checking onboarding status:", error);
+          // If error, assume not onboarded and show form
+          setIsOnboarded(false);
+          setShowOnboardingForm(true);
+        } finally {
+          setIsCheckingOnboarding(false);
+        }
+      } else {
+        // For non-supplier routes or client mode, skip onboarding check
+        setIsOnboarded(true);
+      }
+    };
+
+    checkOnboardingStatus();
+  }, [sup_id, isClientMode, isCreateMode, onboardingForm]);
+
+  // Load data
+  useEffect(() => {
+    const loadData = async () => {
+      // Wait for onboarding check to complete for supplier mode
+      if (sup_id && !isClientMode && isCreateMode && isOnboarded === null) {
+        return; // Wait for onboarding check
+      }
+
+      // If not onboarded, don't load questionnaire data yet
+      if (showOnboardingForm) {
+        return;
+      }
+
+      if ((isViewMode || isEditMode) && sgiq_id) {
+        setIsLoading(true);
+        try {
+          let userIdToUse = user_id;
+          if (!userIdToUse) {
+            const user = authService.getCurrentUser();
+            if (user?.id) userIdToUse = user.id;
+          }
+
+          if (sgiq_id) {
+            const result =
+              await supplierQuestionnaireService.getQuestionnaireById(
+                sgiq_id as string,
+                userIdToUse ?? "",
+              );
+            if (result.success && result.data) {
+              setFormData(result.data);
+              // We need to set form values if we are on the current step
+              // But form values are set via initialValues prop on the DynamicForm
+              // However, when switching steps, we need to ensure data is preserved
+            } else {
+              message.error({
+                content:
+                  result.message ||
+                  "Unable to load the questionnaire. Please try refreshing the page or contact support if the issue persists.",
+                duration: 5,
+              });
+            }
+          }
+        } catch (error) {
+          console.error("Error loading questionnaire:", error);
+          message.error({
+            content:
+              "Failed to load the questionnaire. Please check your internet connection and try again. If the problem persists, contact support.",
+            duration: 5,
+          });
+        } finally {
+          setIsLoading(false);
+        }
+      } else if (isCreateMode) {
+        // Reload an existing draft/submission first: if this supplier already
+        // saved answers for this PCF, hydrate the form from the stored snapshot
+        // so they continue where they left off instead of a blank form.
+        let hydrated = false;
+        if (bom_pcf_id) {
+          setIsLoading(true);
+          try {
+            const mine = await loadMineV3(bom_pcf_id as string, sup_id ?? undefined);
+            const existingId = (mine?.data as any)?.responseId;
+            const snap = (mine?.data as any)?.formSnapshot;
+            if (mine?.status && existingId) {
+              let reformed: Record<string, any> | null = null;
+              if (snap && Object.keys(snap).length > 0) {
+                // Preferred: lossless raw snapshot (saved with the new build).
+                reformed = snap;
+              } else {
+                // Fallback for responses saved before snapshots existed:
+                // rebuild the form from the structured DB data.
+                const full = await loadV3Questionnaire(existingId);
+                if (full?.status && full.data) {
+                  reformed = mapV3BackendToForm(full.data);
+                }
+              }
+              if (reformed) {
+                setV3ResponseId(existingId);
+                setSubmittedSgiqId(existingId);
+                setFormData(reformed);
+                const toSet = reformed;
+                setTimeout(() => form.setFieldsValue(toSet), 200);
+                hydrated = true;
+              }
+            }
+          } catch (e) {
+            console.error("Reload existing questionnaire failed:", e);
+          } finally {
+            setIsLoading(false);
+          }
+        }
+
+        // Client mode auto-populate using product get-by-id API
+        if (!hydrated && isClientMode && product_id) {
+          setIsLoading(true);
+          try {
+            const result = await productService.getProductById(product_id);
+            if (result.status && result.data) {
+              console.log("Client mode - Product API response:", result.data);
+              const productData = result.data;
+
+              // Map product data to form structure
+              // Use schema field names (mpn, component_name) but fill with product data
+              // product_id is stored for backend, not shown in UI
+              const productionSiteDetails = [
+                {
+                  product_id: productData.id, // Hidden, passed to backend
+                  mpn: productData.product_code || "", // Shows as "Product Code" for client
+                  component_name: productData.product_name || "", // Shows as "Product Name" for client
+                  location: "", // To be filled by user
+                },
+              ];
+
+              const productsManufactured = [
+                {
+                  product_id: productData.id, // Hidden, passed to backend
+                  mpn: productData.product_code || "", // Shows as "Product Code" for client
+                  product_name: productData.product_name || "", // Already named product_name in schema
+                  production_period: "",
+                  weight_per_unit: productData.ts_weight_kg || 0,
+                  unit: "Kg",
+                  price: 0,
+                  quantity: 0,
+                },
+              ];
+
+              const autoPopulatedData: any = {
+                product_details: {
+                  production_site_details: productionSiteDetails,
+                  products_manufactured: productsManufactured,
+                },
+              };
+
+              console.log("Client mode - Auto-populated data:", autoPopulatedData);
+
+              // Merge with existing form data
+              const mergedFormData = {
+                ...formData,
+                ...autoPopulatedData,
+              };
+
+              setFormData(mergedFormData);
+
+              // Set form values
+              setTimeout(() => {
+                form.setFieldsValue(mergedFormData);
+              }, 200);
+
+              // Track auto-populated fields
+              const autoPopulatedFieldNames = new Set<string>();
+              autoPopulatedFieldNames.add("product_details.production_site_details");
+              autoPopulatedFieldNames.add("product_details.products_manufactured");
+              setAutoPopulatedFields(autoPopulatedFieldNames);
+
+              message.success({
+                content: `Successfully auto-populated product details for ${productData.product_name}.`,
+                duration: 3,
+              });
+            } else {
+              console.warn("Client mode - Failed to fetch product:", result);
+              message.warning({
+                content: "Could not fetch product details. Please fill them in manually.",
+                duration: 4,
+              });
+            }
+          } catch (error) {
+            console.error("Error auto-populating client data:", error);
+            message.warning({
+              content: "Some product details could not be auto-populated. Please fill them in manually.",
+              duration: 4,
+            });
+          } finally {
+            setIsLoading(false);
+          }
+        }
+        // Auto-populate product details if sup_id and bom_pcf_id are provided (supplier mode).
+        // Skipped when we already rehydrated an existing response above.
+        else if (!hydrated && sup_id && bom_pcf_id) {
+          setIsLoading(true);
+          try {
+            // First check if questionnaire is already submitted
+            const statusResult = await supplierQuestionnaireService.checkQuestionnaireStatus(
+              bom_pcf_id,
+              sup_id,
+            );
+            if (statusResult.success && statusResult.data?.is_submitted) {
+              setIsCompleted(true);
+              setIsLoading(false);
+              return; // Don't load the form if already completed
+            }
+
+            const result =
+              await supplierQuestionnaireService.getPCFBOMListToAutoPopulate(
+                bom_pcf_id,
+                sup_id,
+              );
+            if (result.success && result.data) {
+              console.log("Auto-populate API response:", result.data);
+
+              // Transform API response array to form data structure
+              // API returns: [{ bom_id, bom_code, material_number, component_name, supplier_id }, ...]
+              const bomList = Array.isArray(result.data) ? result.data : [];
+
+              console.log("BOM list from API:", bomList);
+
+              // Map to production_site_details table format
+              // Schema expects: [{ bom_id, material_number, mpn, component_name, location }, ...]
+              const productionSiteDetails = bomList.map(
+                (item: any, index: number) => {
+                  const mapped = {
+                    ...(item.bom_id && { bom_id: item.bom_id }),
+                    ...(item.material_number && {
+                      material_number: item.material_number,
+                    }),
+                    mpn: item.material_number || "",
+                    component_name: item.component_name || "",
+                    location: item.production_location || item.location || "", // May not be in API response
+                  };
+                  console.log(`Mapped item ${index}:`, {
+                    original: item,
+                    mapped,
+                  });
+                  return mapped;
+                },
+              );
+
+              console.log(
+                "Final productionSiteDetails array:",
+                productionSiteDetails,
+              );
+
+              // Map to products_manufactured table format
+              // Expected: [{ bom_id, material_number, mpn, product_name, production_period, weight_per_unit, unit, price, quantity }, ...]
+              const productsManufactured = bomList.map((item: any) => ({
+                ...(item.bom_id && { bom_id: item.bom_id }),
+                ...(item.material_number && {
+                  material_number: item.material_number,
+                }),
+                mpn: item.material_number || "",
+                product_name: item.component_name || "",
+                production_period: "",
+                weight_per_unit: 0,
+                unit: "",
+                price: 0,
+                quantity: 0,
+              }));
+
+              const autoPopulatedData: any = {
+                product_details: {
+                  production_site_details: productionSiteDetails,
+                  products_manufactured: productsManufactured,
+                },
+              };
+
+              console.log(
+                "Transformed auto-populated data:",
+                autoPopulatedData,
+              );
+              console.log("Production site details:", productionSiteDetails);
+              console.log("Products manufactured:", productsManufactured);
+
+              // Merge with existing form data
+              const mergedFormData = {
+                ...formData,
+                ...autoPopulatedData,
+              };
+
+              console.log("Merged form data:", mergedFormData);
+              console.log(
+                "Production site details in merged data:",
+                mergedFormData.product_details?.production_site_details,
+              );
+
+              // Update formData state - this will trigger the useEffect that sets form values
+              setFormData(mergedFormData);
+
+              // Also directly set form values to ensure they're applied
+              // Use setTimeout to ensure form is ready and current step is loaded
+              setTimeout(() => {
+                const currentValues = form.getFieldsValue();
+                console.log(
+                  "Current form values before update:",
+                  currentValues,
+                );
+
+                // Set the values
+                form.setFieldsValue(mergedFormData);
+
+                // Force update by getting values again
+                const updatedValues = form.getFieldsValue();
+                console.log("Form values after update:", updatedValues);
+                console.log(
+                  "Production site details in form:",
+                  updatedValues.product_details?.production_site_details,
+                );
+              }, 200);
+
+              // Track auto-populated fields
+              const autoPopulatedFieldNames = new Set<string>();
+              if (productionSiteDetails.length > 0) {
+                autoPopulatedFieldNames.add(
+                  "product_details.production_site_details",
+                );
+              }
+              if (productsManufactured.length > 0) {
+                autoPopulatedFieldNames.add(
+                  "product_details.products_manufactured",
+                );
+              }
+              setAutoPopulatedFields(autoPopulatedFieldNames);
+
+              if (bomList.length > 0) {
+                message.success({
+                  content: `Successfully auto-populated ${bomList.length} item(s) from BOM data.`,
+                  duration: 3,
+                });
+              }
+            } else {
+              console.warn("Auto-populate failed:", result.message);
+            }
+          } catch (error) {
+            console.error("Error auto-populating data:", error);
+            message.warning({
+              content:
+                "Some product details could not be auto-populated. Please fill them in manually.",
+              duration: 4,
+            });
+          } finally {
+            setIsLoading(false);
+          }
+        }
+
+        // Load draft if exists
+        const draft = supplierQuestionnaireService.loadDraft(
+          sup_id,
+          bom_pcf_id,
+        );
+        if (draft) {
+          // Use deep merge to preserve nested structure while draft values take precedence
+          setFormData((prevData) => {
+            const result = { ...prevData };
+            const mergeDeep = (target: any, source: any): any => {
+              const merged = { ...target };
+              for (const key in source) {
+                if (source[key] !== null && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+                  merged[key] = mergeDeep(merged[key] || {}, source[key]);
+                } else {
+                  merged[key] = source[key];
+                }
+              }
+              return merged;
+            };
+            return mergeDeep(result, draft.formData);
+          });
+          // Validate step index against current schema
+          const savedStep = draft.currentStep || 0;
+          if (savedStep < QUESTIONNAIRE_SCHEMA.length) {
+            setCurrentStep(savedStep);
+          }
+        }
+      }
+    };
+
+    loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    sgiq_id,
+    sup_id,
+    bom_pcf_id,
+    product_id,
+    user_id,
+    isViewMode,
+    isEditMode,
+    isCreateMode,
+    form,
+    isOnboarded,
+    showOnboardingForm,
+    isClientMode,
+  ]);
+
+  // Update form values when step changes or data loads
+  useEffect(() => {
+    form.setFieldsValue(formData);
+  }, [currentStep, formData, form]);
+
+  // Scroll the content panel back to the top on every step change (Next /
+  // Previous / sidebar jump). The window doesn't scroll — the content column
+  // (contentScrollRef) is the overflow container.
+  useEffect(() => {
+    contentScrollRef.current?.scrollTo({ top: 0 });
+  }, [currentStep]);
+
+  // Deep merge utility to preserve nested values (especially file fields)
+  // preserveTargetArrays: when true, keeps target arrays if source arrays are empty (for auto-save)
+  // when false, source always wins (for draft loading)
+  // mergeArrayItems: when true, merges each array item (object spread) so hidden fields like bom_id
+  //   that exist in target but not source are preserved instead of being silently dropped.
+  // dayjs / Date / File / Blob must be treated as opaque primitives by deepMerge,
+  // otherwise their prototypes (and internal $d / lastModified / etc.) get stripped
+  // and methods like toISOString() throw later during JSON.stringify or render.
+  const isOpaqueValue = (v: any): boolean => {
+    if (v === null || typeof v !== 'object') return false;
+    if (v instanceof Date) return true;
+    if (typeof File !== 'undefined' && v instanceof File) return true;
+    if (typeof Blob !== 'undefined' && v instanceof Blob) return true;
+    // dayjs duck-typing — has internal $d + format() method
+    if (typeof (v as any).format === 'function' && (v as any).$d !== undefined) return true;
+    return false;
+  };
+
+  const deepMerge = (target: any, source: any, preserveTargetArrays = false, mergeArrayItems = false): any => {
+    const result = { ...target };
+    for (const key in source) {
+      if (isOpaqueValue(source[key])) {
+        // dayjs / Date / File — copy reference as-is, no spread.
+        result[key] = source[key];
+      } else if (source[key] !== null && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+        // Recursively merge nested objects
+        result[key] = deepMerge(result[key] || {}, source[key], preserveTargetArrays, mergeArrayItems);
+      } else if (Array.isArray(source[key])) {
+        const targetArray = result[key];
+        const sourceArray = source[key];
+
+        if (preserveTargetArrays && sourceArray.length === 0 && targetArray && targetArray.length > 0) {
+          // Keep target array when source is empty (preserves file keys)
+        } else if (mergeArrayItems && Array.isArray(targetArray) && targetArray.length === sourceArray.length) {
+          // Same-length arrays: merge each item so hidden fields (bom_id, material_number, component_name)
+          // from the target row are preserved even if the source row (from form.getFieldsValue) omits them.
+          result[key] = sourceArray.map((srcItem: any, i: number) => {
+            const tgtItem = targetArray[i];
+            if (srcItem && typeof srcItem === 'object' && !Array.isArray(srcItem) &&
+                tgtItem && typeof tgtItem === 'object' && !Array.isArray(tgtItem)) {
+              return { ...tgtItem, ...srcItem };
+            }
+            return srcItem;
+          });
+        } else {
+          result[key] = sourceArray;
+        }
+      } else {
+        result[key] = source[key];
+      }
+    }
+    return result;
+  };
+
+  // Auto-save functionality
+  useEffect(() => {
+    if (isCreateMode && !isViewMode) {
+      // Clear existing timer
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+
+      // Set new timer for auto-save
+      autoSaveTimerRef.current = setTimeout(() => {
+        // Use formData directly - it's already kept up-to-date via onValuesChange
+        // Avoid form.getFieldsValue() as it may return stale/empty values for file fields
+        if (Object.keys(formData).length > 0) {
+          setAutoSaveStatus("saving");
+          supplierQuestionnaireService.saveDraft(
+            formData,
+            currentStep,
+            sup_id,
+            bom_pcf_id,
+          );
+          setAutoSaveStatus("saved");
+          setLastSaved(new Date());
+
+          // Reset to idle after 2 seconds
+          setTimeout(() => setAutoSaveStatus("idle"), 2000);
+        }
+      }, 2000); // Auto-save after 2 seconds of inactivity
+
+      return () => {
+        if (autoSaveTimerRef.current) {
+          clearTimeout(autoSaveTimerRef.current);
+        }
+      };
+    }
+  }, [formData, currentStep, isCreateMode, isViewMode, form, sup_id, bom_pcf_id]);
+
+  // Save draft before browser close/refresh to prevent data loss
+  useEffect(() => {
+    if (!isCreateMode || isViewMode) return;
+
+    const handleBeforeUnload = () => {
+      const values = form.getFieldsValue();
+      const merged = deepMerge(formData, values, false, true);
+      supplierQuestionnaireService.saveDraft(merged, currentStep, sup_id, bom_pcf_id);
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [formData, currentStep, isCreateMode, isViewMode, form, sup_id, bom_pcf_id]);
+
+  // Track completed steps
+  useEffect(() => {
+    const checkStepCompletion = async () => {
+      try {
+        const values = form.getFieldsValue();
+        const section = QUESTIONNAIRE_SCHEMA[currentStep];
+        if (section) {
+          const requiredFields = section.fields.filter(
+            (f) => f.required && !f.dependency,
+          );
+          const hasRequiredData = requiredFields.every((field) => {
+            const fieldValue = form.getFieldValue(field.name.split("."));
+            return (
+              fieldValue !== undefined &&
+              fieldValue !== null &&
+              fieldValue !== ""
+            );
+          });
+
+          if (hasRequiredData) {
+            setCompletedSteps((prev) => new Set([...prev, currentStep]));
+          }
+        }
+      } catch (error) {
+        // Ignore validation errors for completion check
+      }
+    };
+
+    checkStepCompletion();
+  }, [currentStep, formData, form]);
+
+  // Calculate progress based on questions answered
+  const [progressPercentage, setProgressPercentage] = useState(0);
+  const [answeredCount, setAnsweredCount] = useState(0);
+  const [totalQuestionsCount, setTotalQuestionsCount] = useState(0);
+
+  useEffect(() => {
+    const calculateProgress = () => {
+      let totalQuestions = 0;
+      let answeredQuestions = 0;
+
+      // Get all current form values
+      const allFormValues = form.getFieldsValue();
+      // Use deep merge to preserve nested values (especially file fields across steps)
+      const mergedValues = deepMerge(formData, allFormValues, true);
+
+      const getNestedValue = (obj: any, path: string): any => {
+        return path.split(".").reduce((acc, part) => {
+          if (acc === null || acc === undefined) return undefined;
+          return acc[part];
+        }, obj);
+      };
+
+      const isFieldVisible = (field: any): boolean => {
+        // Check if field has dependency and if it's met
+        if (field.dependency) {
+          const dependencyValue = getNestedValue(
+            mergedValues,
+            field.dependency.field,
+          );
+          const expectedValue = field.dependency.value;
+
+          // Check if dependency field has been answered
+          const isAnswered =
+            dependencyValue !== undefined &&
+            dependencyValue !== null &&
+            dependencyValue !== "";
+
+          if (!isAnswered) return false;
+
+          if (typeof expectedValue === "boolean") {
+            // Convert dependencyValue to boolean for comparison (handles "Yes"/"No" strings)
+            const depBool =
+              typeof dependencyValue === "string"
+                ? dependencyValue.toLowerCase() === "yes" ||
+                  dependencyValue.toLowerCase() === "true"
+                : Boolean(dependencyValue);
+            if (depBool !== expectedValue) return false;
+          } else if (Array.isArray(dependencyValue)) {
+            if (!dependencyValue.includes(expectedValue)) return false;
+          } else {
+            // Case-insensitive comparison for string values
+            const depStr = String(dependencyValue).toLowerCase();
+            const expStr = String(expectedValue).toLowerCase();
+            if (depStr !== expStr) return false;
+          }
+        }
+        return true;
+      };
+
+      const isCellFilled = (v: any): boolean => {
+        if (v === undefined || v === null || v === "") return false;
+        if (Array.isArray(v) && v.length === 0) return false;
+        if (typeof v === "object" && !Array.isArray(v)) {
+          return Object.values(v).some(isCellFilled);
+        }
+        return true;
+      };
+
+      const isFieldAnswered = (field: any): boolean => {
+        const fieldValue = getNestedValue(mergedValues, field.name);
+
+        // Check if field has a value
+        if (field.type === "table") {
+          // A default empty row is created by the form, so length > 0 is not enough.
+          // Count the table as answered only if at least one row has a real value.
+          if (!Array.isArray(fieldValue) || fieldValue.length === 0) return false;
+          return fieldValue.some(
+            (row: any) =>
+              row && typeof row === "object" && Object.values(row).some(isCellFilled)
+          );
+        } else if (field.type === "checkbox" && field.options) {
+          // For multi-select checkboxes, check if at least one is selected
+          return Array.isArray(fieldValue) && fieldValue.length > 0;
+        } else if (field.type === "checkbox") {
+          // For single checkbox, check if it's checked
+          return fieldValue === true;
+        } else {
+          // For other fields, check if value exists and is not empty
+          return (
+            fieldValue !== undefined &&
+            fieldValue !== null &&
+            fieldValue !== "" &&
+            !(Array.isArray(fieldValue) && fieldValue.length === 0)
+          );
+        }
+      };
+
+      // Only count "main" questions — those with a single integer prefix in the
+      // label (e.g. "1.", "10."). Excludes General Information acknowledgements
+      // (no number prefix) and sub-questions like "5.1" / "5.2".
+      const isMainQuestion = (field: any): boolean =>
+        typeof field.label === "string" && /^\d+\.\s/.test(field.label);
+
+      // Iterate through all sections and fields
+      QUESTIONNAIRE_SCHEMA.forEach((section) => {
+        section.fields.forEach((field) => {
+          // Skip info fields (they're not questions)
+          if (field.type === "info") {
+            return;
+          }
+
+          if (!isMainQuestion(field)) {
+            return;
+          }
+
+          // Check if field is visible (dependencies met)
+          if (isFieldVisible(field)) {
+            totalQuestions++;
+
+            // Check if field is answered
+            if (isFieldAnswered(field)) {
+              answeredQuestions++;
+            }
+          }
+        });
+      });
+
+      const percentage =
+        totalQuestions === 0
+          ? 0
+          : Math.round((answeredQuestions / totalQuestions) * 100);
+      setProgressPercentage(percentage);
+      setAnsweredCount(answeredQuestions);
+      setTotalQuestionsCount(totalQuestions);
+    };
+
+    calculateProgress();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formData, form, currentStep]);
+
+  // Also recalculate when form values change
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const allFormValues = form.getFieldsValue();
+      if (Object.keys(allFormValues).length > 0) {
+        setFormData((prev) => deepMerge(prev, allFormValues, false, true));
+      }
+    }, 500); // Debounce form value updates
+
+    return () => clearTimeout(timer);
+  }, [form]);
+
+  const completedCount = completedSteps.size;
+
+  const handleNext = async () => {
+    try {
+      // Validate current step fields
+      const values = await form.validateFields();
+
+      // Merge current step values into global form data (mergeArrayItems preserves bom_id on rows)
+      const updatedData = deepMerge(formData, values, false, true);
+      setFormData(updatedData);
+      setFormErrors({});
+
+      if (isCreateMode) {
+        supplierQuestionnaireService.saveDraft(
+          updatedData,
+          currentStep + 1,
+          sup_id,
+          bom_pcf_id,
+        );
+        setLastSaved(new Date());
+      }
+
+      setCompletedSteps((prev) => new Set([...prev, currentStep]));
+      setCurrentStep(currentStep + 1);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (error: any) {
+      console.error("Validation failed:", error);
+
+      // Keep it simple: one gentle prompt, then scroll to the first unfilled
+      // question. Ant Design already marks each required field inline, so we
+      // don't surface a separate error summary.
+      message.warning({
+        content: "Please fill in the required questions before continuing.",
+        duration: 3,
+      });
+      const firstErrorField = document.querySelector(
+        ".ant-form-item-has-error",
+      );
+      if (firstErrorField) {
+        firstErrorField.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
+  };
+
+  const handlePrev = () => {
+    // Save current values before moving back (mergeArrayItems preserves bom_id on rows)
+    const values = form.getFieldsValue();
+    const updatedData = deepMerge(formData, values, false, true);
+    setFormData(updatedData);
+    setFormErrors({});
+
+    // Save draft immediately on navigation to prevent data loss
+    if (isCreateMode) {
+      supplierQuestionnaireService.saveDraft(updatedData, currentStep - 1, sup_id, bom_pcf_id);
+      setLastSaved(new Date());
+    }
+
+    setCurrentStep(currentStep - 1);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleStepJump = (step: number) => {
+    if (step < currentStep || completedSteps.has(step)) {
+      const values = form.getFieldsValue();
+      const updatedData = deepMerge(formData, values, false, true);
+      setFormData(updatedData);
+      setFormErrors({});
+
+      // Save draft immediately on navigation to prevent data loss
+      if (isCreateMode) {
+        supplierQuestionnaireService.saveDraft(updatedData, step, sup_id, bom_pcf_id);
+        setLastSaved(new Date());
+      }
+
+      setCurrentStep(step);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      setSidebarVisible(false); // Close mobile sidebar
+    }
+  };
+
+  const handleSaveDraft = async () => {
+    setIsSaving(true);
+    setAutoSaveStatus("saving");
+    try {
+      const values = form.getFieldsValue();
+      const updatedData = deepMerge(formData, values, false, true);
+      setFormData(updatedData);
+
+      if (!sup_id || !bom_pcf_id) {
+        throw new Error("Missing supplier or PCF identifiers — cannot save draft.");
+      }
+
+      const v3Result = await saveV3Questionnaire(updatedData, {
+        bomPcfRequestId: bom_pcf_id,
+        supplierId: sup_id,
+        responseId: v3ResponseId ?? undefined,
+        status: "draft",
+      });
+      if (!v3Result?.status) {
+        throw new Error(v3Result?.message || "Draft save failed");
+      }
+      const newId = v3Result?.data?.responseId;
+      if (newId && newId !== v3ResponseId) setV3ResponseId(newId);
+
+      setLastSaved(new Date());
+      setAutoSaveStatus("saved");
+      message.success({
+        content: "Draft saved successfully! Your progress has been saved.",
+        duration: 2,
+      });
+
+      setTimeout(() => setAutoSaveStatus("idle"), 2000);
+    } catch (error) {
+      setAutoSaveStatus("idle");
+      message.error({
+        content:
+          "Unable to save your draft. Please check your internet connection and try again. Your progress may be lost if you leave this page.",
+        duration: 5,
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleSubmit = async () => {
+    try {
+      const values = await form.validateFields();
+      const finalData = deepMerge(formData, values, false, true);
+
+      if (!sup_id || !bom_pcf_id) {
+        throw new Error("Missing supplier or PCF identifiers — cannot submit.");
+      }
+
+      setIsSaving(true);
+      setFormErrors({});
+
+      const v3Save = await saveV3Questionnaire(finalData, {
+        bomPcfRequestId: bom_pcf_id,
+        supplierId: sup_id,
+        responseId: v3ResponseId ?? undefined,
+        status: "submitted",
+      });
+      if (!v3Save?.status) {
+        message.error({
+          content: v3Save?.message
+            ? `Submission failed: ${v3Save.message}`
+            : "Unable to submit the questionnaire. Please try again.",
+          duration: 6,
+        });
+        return;
+      }
+
+      const v3Id = v3Save?.data?.responseId ?? v3ResponseId;
+      if (!v3Id) {
+        throw new Error("Backend did not return a response id.");
+      }
+      setV3ResponseId(v3Id);
+      setSubmittedSgiqId(v3Id);
+
+      const v3Submit = await submitV3Questionnaire(v3Id);
+      if (!v3Submit?.status) {
+        const validationErrors =
+          (v3Submit?.data as any)?.errors as Array<{ field: string; message: string }> | undefined;
+        if (validationErrors?.length) {
+          const errMap: Record<string, string[]> = {};
+          validationErrors.forEach((e) => {
+            errMap[e.field] = [...(errMap[e.field] ?? []), e.message];
+          });
+          setFormErrors(errMap);
+        }
+        message.error({
+          content: v3Submit?.message ?? "Submission validation failed.",
+          duration: 6,
+        });
+        return;
+      }
+
+      if (isPublicRoute || isClientMode) {
+        setIsCompleted(true);
+      } else {
+        message.success({
+          content:
+            "Questionnaire submitted successfully! Thank you for completing the form.",
+          duration: 4,
+        });
+        navigate("/supplier-questionnaire");
+      }
+    } catch (error: any) {
+      console.error("Submit error:", error);
+
+      // Same gentle prompt as Next: required fields are marked inline, so just
+      // nudge the supplier and scroll to the first one.
+      message.warning({
+        content: "Please fill in the required questions before submitting.",
+        duration: 3,
+      });
+      const firstErrorField = document.querySelector(
+        ".ant-form-item-has-error",
+      );
+      if (firstErrorField) {
+        firstErrorField.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Handle PDF download on Thank You screen.
+  // Frontend resolves dropdown IDs -> names and builds a schema-shaped
+  // sections structure, then posts it to the backend which renders the PDF
+  // via pdfkit (consistent output, branding, future extensibility).
+  const handleDownloadPdf = async () => {
+    setIsDownloadingPdf(true);
+    try {
+      // V3 form uses static option lists, not API-backed dropdown IDs — empty maps are fine.
+      const sections = buildPdfSections(formData, {});
+
+      const supplierName =
+        formData?.company?.legal_name ||
+        formData?.supplier_company_name ||
+        "Supplier";
+
+      const result = await downloadV3Pdf({
+        sections,
+        supplier_name: supplierName,
+        submission_date: new Date().toISOString(),
+        reference_id: submittedSgiqId || v3ResponseId || undefined,
+        bom_pcf_id: bom_pcf_id || undefined,
+      });
+
+      if (result.success && result.blob) {
+        const sanitized = String(supplierName).replace(/[^a-zA-Z0-9]/g, "_").replace(/_+/g, "_");
+        const url = URL.createObjectURL(result.blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `Supplier_Questionnaire_${sanitized}_${new Date().toISOString().split("T")[0]}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        message.success({ content: "PDF report downloaded successfully!", duration: 3 });
+      } else {
+        message.error({
+          content: result.message || "Failed to generate PDF. Please try again.",
+          duration: 4,
+        });
+      }
+    } catch (error) {
+      console.error("Error generating PDF:", error);
+      message.error({
+        content: "Failed to generate PDF report. Please try again.",
+        duration: 4,
+      });
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  };
+
+  // Handle supplier onboarding form submission
+  const handleOnboardingSubmit = async (values: any) => {
+    if (!sup_id) return;
+
+    setIsSubmittingOnboarding(true);
+    try {
+      const payload = {
+        ...values,
+        sup_id,
+        supplier_supplied_categories: values.supplier_supplied_categories
+          ? values.supplier_supplied_categories.split(",").map((s: string) => s.trim()).filter(Boolean)
+          : [],
+      };
+
+      const result = await userManagementService.onboardSupplierPublic(payload);
+
+      if (result.success) {
+        message.success("Onboarding completed successfully! Proceeding to questionnaire...");
+        setIsOnboarded(true);
+        setShowOnboardingForm(false);
+      } else {
+        message.error(result.message || "Failed to complete onboarding");
+      }
+    } catch (error) {
+      console.error("Error submitting onboarding:", error);
+      message.error("An error occurred while submitting onboarding");
+    } finally {
+      setIsSubmittingOnboarding(false);
+    }
+  };
+
+  // Keyboard shortcuts - using refs to avoid dependency issues
+  const handleNextRef = useRef(handleNext);
+  const handleSubmitRef = useRef(handleSubmit);
+  const openPreviewRef = useRef(() => {
+    const values = form.getFieldsValue();
+    const updatedData = deepMerge(formData, values, false, true);
+    setFormData(updatedData);
+    setIsPreviewOpen(true);
+  });
+
+  useEffect(() => {
+    handleNextRef.current = handleNext;
+    handleSubmitRef.current = handleSubmit;
+    openPreviewRef.current = () => {
+      const values = form.getFieldsValue();
+      const updatedData = deepMerge(formData, values, false, true);
+      setFormData(updatedData);
+      setIsPreviewOpen(true);
+    };
+  });
+
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      // Ctrl/Cmd + Enter: on last step opens preview (submit happens inside preview), otherwise goes to next step
+      if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+        if (currentStep === QUESTIONNAIRE_SCHEMA.length - 1) {
+          openPreviewRef.current();
+        } else {
+          handleNextRef.current();
+        }
+      }
+      // Escape to close sidebar on mobile
+      if (e.key === "Escape" && sidebarVisible) {
+        setSidebarVisible(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyPress);
+    return () => window.removeEventListener("keydown", handleKeyPress);
+  }, [currentStep, sidebarVisible]);
+
+  if (isLoading || isCheckingOnboarding) {
+    return (
+      <div className="flex justify-center items-center h-screen">
+        <LoadingSpinner
+          size="lg"
+          label={isCheckingOnboarding ? "Checking supplier status..." : "Loading questionnaire..."}
+        />
+      </div>
+    );
+  }
+
+  // Supplier Onboarding Form - Show before questionnaire if not onboarded
+  if (showOnboardingForm && sup_id && !isClientMode) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-purple-50 to-indigo-100 py-8 px-4">
+        <div className="max-w-4xl mx-auto space-y-6">
+          {/* Header */}
+          <div className="bg-white rounded-2xl p-6 border border-gray-100 shadow-lg">
+            <div className="flex items-center gap-4">
+              <div className="w-14 h-14 bg-gradient-to-br from-purple-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-purple-500/20">
+                <InfoCircleOutlined className="text-2xl text-white" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-bold text-gray-900">
+                  Supplier Registration Required
+                </h1>
+                <p className="text-gray-500">
+                  Please complete your company registration before proceeding to the questionnaire
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Onboarding Form */}
+          <div className="bg-white rounded-2xl p-6 border border-gray-100 shadow-lg">
+            <Form
+              form={onboardingForm}
+              layout="vertical"
+              onFinish={handleOnboardingSubmit}
+              className="space-y-6"
+            >
+              {/* Company Information */}
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Company Information</h3>
+                <Row gutter={16}>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_company_name"
+                      label="Company Name"
+                      rules={[{ required: true, message: "Please enter company name" }]}
+                    >
+                      <Input placeholder="Enter company name" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_name"
+                      label="Contact Name"
+                      rules={[{ required: true, message: "Please enter contact name" }]}
+                    >
+                      <Input placeholder="Enter contact name" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_email"
+                      label="Email"
+                      rules={[
+                        { required: true, message: "Please enter email" },
+                        { type: "email", message: "Please enter a valid email" },
+                      ]}
+                    >
+                      <Input placeholder="Enter email" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_phone_number"
+                      label="Phone Number"
+                      rules={[{ required: true, message: "Please enter phone number" }]}
+                    >
+                      <Input placeholder="Enter phone number" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_alternate_phone_number" label="Alternate Phone">
+                      <Input placeholder="Enter alternate phone" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_company_website" label="Website">
+                      <Input placeholder="Enter website URL" />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </div>
+
+              <Divider />
+
+              {/* Business Details */}
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Business Details</h3>
+                <Row gutter={16}>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_business_type" label="Business Type">
+                      <Select placeholder="Select business type">
+                        <Select.Option value="Manufacturer">Manufacturer</Select.Option>
+                        <Select.Option value="Distributor">Distributor</Select.Option>
+                        <Select.Option value="Wholesaler">Wholesaler</Select.Option>
+                        <Select.Option value="Retailer">Retailer</Select.Option>
+                        <Select.Option value="Other">Other</Select.Option>
+                      </Select>
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_years_in_business" label="Years in Business">
+                      <Input placeholder="Enter years" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_number_of_employees" label="Number of Employees">
+                      <Input placeholder="Enter number" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24}>
+                    <Form.Item
+                      name="supplier_supplied_categories"
+                      label="Supplied Categories"
+                      extra="Enter comma-separated values"
+                    >
+                      <Input.TextArea rows={2} placeholder="e.g., Electronics, Mechanical Parts, Raw Materials" />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </div>
+
+              <Divider />
+
+              {/* Location */}
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Location</h3>
+                <Row gutter={16}>
+                  <Col xs={24}>
+                    <Form.Item name="supplier_registered_address" label="Registered Address">
+                      <Input.TextArea rows={2} placeholder="Enter registered address" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_city"
+                      label="City"
+                      rules={[{ required: true, message: "Please enter city" }]}
+                    >
+                      <Input placeholder="Enter city" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_state"
+                      label="State"
+                      rules={[{ required: true, message: "Please enter state" }]}
+                    >
+                      <Input placeholder="Enter state" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item
+                      name="supplier_country"
+                      label="Country"
+                      rules={[{ required: true, message: "Please enter country" }]}
+                    >
+                      <Input placeholder="Enter country" />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </div>
+
+              <Divider />
+
+              {/* Financial Details */}
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Financial Details (Optional)</h3>
+                <Row gutter={16}>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_gst_number" label="GST Number">
+                      <Input placeholder="Enter GST number" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_pan_number" label="PAN Number">
+                      <Input placeholder="Enter PAN number" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={8}>
+                    <Form.Item name="supplier_bank_name" label="Bank Name">
+                      <Input placeholder="Enter bank name" />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </div>
+
+              {/* Submit Button */}
+              <div className="flex justify-center pt-6 border-t border-gray-100">
+                <Button
+                  type="primary"
+                  htmlType="submit"
+                  loading={isSubmittingOnboarding}
+                  size="large"
+                  icon={<CheckOutlined />}
+                  className="!bg-purple-600 hover:!bg-purple-700 !border-purple-600 shadow-lg shadow-purple-600/20 px-12"
+                >
+                  Complete Registration & Continue
+                </Button>
+              </div>
+            </Form>
+          </div>
+
+          {/* Footer */}
+          <div className="text-center text-gray-500 text-sm">
+            <p>Your registration information helps us better understand your business for PCF calculations.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Thank You UI for completed questionnaires
+  if (isCompleted) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100 flex items-center justify-center p-6">
+        <div className="bg-white rounded-2xl shadow-xl p-8 md:p-12 max-w-lg w-full text-center">
+          <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-6">
+            <CheckCircleOutlined className="text-4xl text-green-600" />
+          </div>
+          <h1 className="text-3xl font-bold text-gray-800 mb-4">
+            Thank You!
+          </h1>
+          <p className="text-lg text-gray-600 mb-6">
+            Your questionnaire has been successfully submitted.
+          </p>
+          <div className="bg-green-50 border border-green-200 rounded-xl p-4 mb-6">
+            <div className="flex items-center justify-center gap-2 text-green-700">
+              <SmileOutlined className="text-xl" />
+              <span className="font-medium">
+                We appreciate your time and effort in completing this questionnaire.
+              </span>
+            </div>
+          </div>
+
+          {/* Download PDF Button */}
+          <Button
+            type="primary"
+            size="large"
+            icon={<DownloadOutlined />}
+            onClick={handleDownloadPdf}
+            loading={isDownloadingPdf}
+            block
+            className="!bg-green-600 hover:!bg-green-700 !border-green-600 shadow-lg shadow-green-600/20 h-12 text-base font-medium mb-4"
+          >
+            Download PDF Report
+          </Button>
+
+          <p className="text-sm text-gray-500">
+            Download a copy of your responses for your records. Your data has been recorded and will be used for the Product Carbon Footprint calculation.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const currentSection = QUESTIONNAIRE_SCHEMA[currentStep];
+  const totalSteps = QUESTIONNAIRE_SCHEMA.length;
+  const isLastStep = currentStep === totalSteps - 1;
+  const sectionMeta = SECTION_META[currentSection?.id ?? ""] || {
+    blurb: currentSection?.description || "",
+  };
+
+  const stepDot = (
+    status: "done" | "current" | "upcoming",
+  ): React.CSSProperties => {
+    const base: React.CSSProperties = {
+      flex: "none",
+      width: 24,
+      height: 24,
+      borderRadius: "50%",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 12,
+      fontWeight: 700,
+    };
+    if (status === "done")
+      return { ...base, background: "#16a34a", color: "#fff", fontSize: 13 };
+    if (status === "current")
+      return {
+        ...base,
+        background: "#16a34a",
+        color: "#fff",
+        boxShadow: "0 0 0 4px #dcfce7",
+      };
+    return { ...base, background: "#f1f5f9", color: "#94a3b8", fontWeight: 600 };
+  };
+
+  const renderSidebar = () => (
+    <div
+      className="ff-scroll"
+      style={{ height: "100%", overflowY: "auto", padding: "22px 18px" }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+          marginBottom: 12,
+        }}
+      >
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 700,
+            letterSpacing: ".06em",
+            textTransform: "uppercase",
+            color: "#64748b",
+          }}
+        >
+          Progress
+        </span>
+        <span style={{ fontSize: 12.5, fontWeight: 600 }}>
+          {currentStep + 1} of {totalSteps}
+        </span>
+      </div>
+      <div
+        style={{
+          height: 7,
+          borderRadius: 99,
+          background: "#eef1f4",
+          overflow: "hidden",
+          marginBottom: 8,
+        }}
+      >
+        <div
+          style={{
+            height: "100%",
+            borderRadius: 99,
+            background: "linear-gradient(90deg,#22c55e,#16a34a)",
+            width: `${progressPercentage}%`,
+            transition: "width .3s",
+          }}
+        />
+      </div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 12,
+          color: "#94a3b8",
+          marginBottom: 20,
+        }}
+      >
+        <span>
+          {answeredCount} of {totalQuestionsCount} answered
+        </span>
+        <span style={{ fontWeight: 600, color: "#64748b" }}>
+          {progressPercentage}%
+        </span>
+      </div>
+      {QUESTIONNAIRE_SCHEMA.map((s, index) => {
+        const isCur = index === currentStep;
+        const done = !isCur && (completedSteps.has(index) || index < currentStep);
+        const status: "done" | "current" | "upcoming" = isCur
+          ? "current"
+          : done
+            ? "done"
+            : "upcoming";
+        const canJump = index < currentStep || completedSteps.has(index);
+        return (
+          <div
+            key={s.id}
+            onClick={() => handleStepJump(index)}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 11,
+              padding: "9px 10px",
+              borderRadius: 10,
+              marginBottom: 2,
+              cursor: canJump ? "pointer" : "default",
+              background: isCur ? "#f0fdf4" : "transparent",
+            }}
+          >
+            <div style={stepDot(status)}>{done ? "✓" : index + 1}</div>
+            <span
+              style={{
+                fontSize: 13.5,
+                lineHeight: 1.35,
+                fontWeight: isCur ? 650 : 500,
+                color: isCur ? "#0f1b24" : done ? "#475569" : "#94a3b8",
+              }}
+            >
+              {s.title}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div
+      className="sq-fullform"
+      style={{
+        height: "100vh",
+        background: C.pageBg,
+        color: "#0f1b24",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}
+    >
+      {/* Top bar */}
+      <div
+        style={{
+          height: 60,
+          flex: "none",
+          background: "#fff",
+          borderBottom: "1px solid #e9edf1",
+          display: "flex",
+          alignItems: "center",
+          gap: 16,
+          padding: "0 16px",
+          zIndex: 10,
+        }}
+      >
+        <Button
+          icon={<MenuOutlined />}
+          type="text"
+          onClick={() => setSidebarVisible(true)}
+          className="lg:hidden"
+        />
+        {!isPublicRoute && (
+          <Button
+            icon={<ArrowLeftOutlined />}
+            type="text"
+            onClick={() => navigate("/dashboard")}
+            className="hidden lg:inline-flex"
+          />
+        )}
+        <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: "-.01em" }}>
+          {isClientMode
+            ? "Manufacturer Own Emissions Questionnaire"
+            : "Supplier Questionnaire"}
+        </span>
+        <span
+          className="hidden sm:inline"
+          style={{
+            fontSize: 12,
+            color: "#94a3b8",
+            fontWeight: 500,
+            borderLeft: "1px solid #e4e9ee",
+            paddingLeft: 14,
+          }}
+        >
+          Product Carbon Footprint · ISO 14067
+        </span>
+        <div
+          style={{
+            marginLeft: "auto",
+            display: "flex",
+            alignItems: "center",
+            gap: 14,
+          }}
+        >
+          {isCreateMode && (lastSaved || autoSaveStatus !== "idle") && (
+            <span
+              className="hidden sm:flex"
+              style={{
+                alignItems: "center",
+                gap: 6,
+                fontSize: 12.5,
+                color: "#16a34a",
+                fontWeight: 600,
+              }}
+            >
+              <span
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  background: autoSaveStatus === "saving" ? "#f59e0b" : "#22c55e",
+                }}
+              />
+              {autoSaveStatus === "saving" ? "Saving…" : "Auto-saved"}
+            </span>
+          )}
+          {isCreateMode && (
+            <Button
+              icon={<SaveOutlined />}
+              onClick={handleSaveDraft}
+              loading={isSaving}
+            >
+              <span className="hidden sm:inline">Save draft</span>
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        {/* Desktop sidebar */}
+        <div
+          className="hidden lg:block"
+          style={{
+            width: 292,
+            flex: "none",
+            background: "#fff",
+            borderRight: "1px solid #e9edf1",
+          }}
+        >
+          {renderSidebar()}
+        </div>
+
+        {/* Content */}
+        <div
+          ref={contentScrollRef}
+          className="ff-scroll"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflowY: "auto",
+            padding: "30px 24px 70px",
+          }}
+        >
+          <div style={{ maxWidth: 880, margin: "0 auto" }}>
+            <span
+              style={{
+                fontSize: 11.5,
+                fontWeight: 700,
+                letterSpacing: ".08em",
+                textTransform: "uppercase",
+                color: "#16a34a",
+              }}
+            >
+              Step {currentStep + 1} of {totalSteps}
+            </span>
+            <h1
+              style={{
+                fontSize: 25,
+                fontWeight: 800,
+                letterSpacing: "-.02em",
+                margin: "5px 0 6px",
+              }}
+            >
+              {currentSection?.title}
+            </h1>
+            <p
+              style={{
+                fontSize: 14,
+                color: "#64748b",
+                margin: "0 0 26px",
+                lineHeight: 1.5,
+              }}
+            >
+              {sectionMeta.blurb}
+            </p>
+
+            {currentSection && (
+              <QuestionnaireCardForm
+                section={currentSection}
+                initialValues={formData}
+                form={form}
+                bomComponents={bomComponents}
+                isClientMode={isClientMode}
+                formErrors={formErrors}
+                onValuesChange={(_changedValues, allValues) => {
+                  setFormData((prev) => deepMerge(prev, allValues, false, true));
+
+                  if (
+                    sup_id &&
+                    bom_pcf_id &&
+                    !hasCalledStageUpdateRef.current &&
+                    !isClientMode
+                  ) {
+                    hasCalledStageUpdateRef.current = true;
+                    supplierQuestionnaireService
+                      .updateDataCollectionQuestionStage(bom_pcf_id, sup_id)
+                      .then((result) => {
+                        if (!result.success) {
+                          console.warn(
+                            "Failed to update data collection stage:",
+                            result.message,
+                          );
+                        }
+                      })
+                      .catch((error) => {
+                        console.error(
+                          "Error updating data collection stage:",
+                          error,
+                        );
+                      });
+                  }
+                }}
+              />
+            )}
+
+            {/* Footer nav */}
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                marginTop: 26,
+              }}
+            >
+              <Button
+                size="large"
+                onClick={handlePrev}
+                disabled={currentStep === 0}
+                icon={<ArrowLeftOutlined />}
+              >
+                Previous
+              </Button>
+              {!isLastStep ? (
+                <Button type="primary" size="large" onClick={handleNext}>
+                  Save &amp; continue →
+                </Button>
+              ) : (
+                <Button
+                  type="primary"
+                  size="large"
+                  icon={<EyeOutlined />}
+                  onClick={() => {
+                    const values = form.getFieldsValue();
+                    const updatedData = deepMerge(formData, values, false, true);
+                    setFormData(updatedData);
+                    setIsPreviewOpen(true);
+                  }}
+                >
+                  Preview &amp; Submit
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile sidebar drawer */}
+      <Drawer
+        title="Navigation"
+        placement="left"
+        onClose={() => setSidebarVisible(false)}
+        open={sidebarVisible}
+        width={300}
+        className="lg:hidden"
+      >
+        {renderSidebar()}
+      </Drawer>
+
+      {/* Preview Modal */}
+      <QuestionnairePreviewModal
+        open={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+        formData={formData}
+        onSubmit={async () => {
+          await handleSubmit();
+          setIsPreviewOpen(false);
+        }}
+        isSubmitting={isSaving}
+      />
+
+      {/* Eco AI guide — chat + voice help, aware of the current section */}
+      {currentSection && !isViewMode && (
+        <QuestionnaireAssistant
+          section={currentSection}
+          stepIndex={currentStep}
+          totalSteps={totalSteps}
+        />
+      )}
+    </div>
+  );
+};
+
+export default SupplierQuestionnaire;
